@@ -13,17 +13,15 @@ End-to-end script that
 
 Edit only the BLOCK titled “USER SETTINGS”.
 """
-
+  
 # ────────── USER SETTINGS ────────────────────────────────────────────────────
-IMG_A        = "bol.png"   # path to first image
-IMG_B        = "bol2.png"   # path to second image
 
 WHITE_BALANCE = False           # simple gray-world; set True if needed
 SAT_THRESH    = 5               # Lab chroma below this is treated as gray
 K             = None            # None → pick via BIC over 3–8; else int
-K_BIC_RANGE   = range(3, 9)
+K_BIC_RANGE   = range(5, 8)
 
-WINDOW_PX     = 280 # rolling-window side (pixels)
+WINDOW_PX     = 270 # rolling-window side (pixels)
 RNG_SEED      = 0               # reproducibility
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -34,6 +32,8 @@ from pathlib import Path
 from scipy.ndimage import uniform_filter
 import pandas as pd
 import numpy as np
+from collections import defaultdict
+
 
 # ---------- helpers ----------------------------------------------------------
 def gray_world(bgr: np.ndarray, eps: float = 1e-6) -> np.ndarray:
@@ -42,7 +42,7 @@ def gray_world(bgr: np.ndarray, eps: float = 1e-6) -> np.ndarray:
     return np.clip(bgr.astype(np.float32) / g * g.mean(), 0, 255).astype(np.uint8)
 
 def lab_features(bgr: np.ndarray):
-    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float64)
     a, b = lab[..., 1], lab[..., 2]
     feats = np.stack([a, b], -1).reshape(-1, 2)
     chroma = np.linalg.norm(feats, axis=1)
@@ -74,19 +74,91 @@ def hue_sort_remap(gmm: GaussianMixture, labels: np.ndarray):
     cmap = ListedColormap(base(np.linspace(0, 1, len(order))), name="hue_sorted")
     return remapped, cmap
 
-# ---------- main workflow ----------------------------------------------------
-def main():
-    # load images
-    imgs_bgr = []
-    for path in (IMG_A, IMG_B):
-        if not Path(path).is_file():
-            raise SystemExit(f"File not found: {path}")
-        bgr = cv2.imread(path)
-        if WHITE_BALANCE:
-            bgr = gray_world(bgr)
-        imgs_bgr.append(bgr)
+def load_and_wb(path, white_balance=True):
+    """Load BGR image (OpenCV) and optionally apply Gray-World WB."""
+    if not Path(path).is_file():
+        raise FileNotFoundError(path)
+    img = cv2.imread(str(path))
+    return gray_world(img) if white_balance else img          # <- your util
 
-    # extract Lab features
+def group_frac_above_thresh(density_maps, labels, thresholds):
+    """For every t in thresholds, return mean fraction of pixels ≥ t per label."""
+    per_label = defaultdict(list)
+    for dens, lab in zip(density_maps, labels):
+        per_label[lab].append(dens)
+
+    out = {lab: [] for lab in per_label}
+    for t in thresholds:
+        for lab in per_label:
+            fractions = [(dm >= t).mean() for dm in per_label[lab]]
+            out[lab].append(np.mean(fractions))
+    return out
+
+# --------------------------------------------------------------------------
+# --- automatic window-size selection --------------------------------------
+# --------------------------------------------------------------------------
+def choose_optimal_window(blueness_maps, labels, w_list=None, tol=0.02):
+    """
+    Sweep candidate window sizes and pick the first one whose mean SD has
+    plateaued (within `tol` of the asymptotic σ∞).  Returns `windowpx`, `df`.
+    Works with any number of images per sample.
+    """
+    if w_list is None:
+        w_list = list(range(3, 41, 2)) + list(range(32, 301, 8))
+
+    # for speed we aggregate *per sample* at each window size
+    sample_names = sorted(set(labels))
+    rows, prev = [], {lab: None for lab in sample_names}
+
+    for w in w_list:
+        # smooth every image with current window size
+        smoothed = {lab: [] for lab in sample_names}
+        for blu, lab in zip(blueness_maps, labels):
+            smoothed[lab].append(uniform_filter(blu, size=w, mode="reflect"))
+
+        # metrics aggregated over all imgs in a sample
+        for lab in sample_names:
+            all_d = np.stack(smoothed[lab])
+            sd_lab = all_d.std()
+            delta   = (np.nan if prev[lab] is None
+                       else np.mean(np.abs(all_d - prev[lab])))
+            prev[lab] = all_d
+
+            rows.append(dict(sample=lab, w=w, sd=sd_lab, delta=delta))
+
+    df = (pd.DataFrame(rows)
+            .pivot(index='w', columns='sample', values=['sd','delta'])
+            .sort_index())
+
+    # mean over samples → same logic as before
+    df['sd_mean']    = df['sd'].mean(axis=1)
+    df['delta_mean'] = df['delta'].mean(axis=1)
+
+    sigma_inf = np.median(df['sd_mean'].tail(5))
+    candidate = df[df['sd_mean'] <= sigma_inf * (1 + tol)].index[0]
+    return int(candidate), df
+
+
+
+# --------------------------------------------------------------------------
+# --- main workflow --------------------------------------------------------
+# --------------------------------------------------------------------------
+def main(sampleA_paths, sampleB_paths,
+         k_clusters=K,
+         thresholds=np.linspace(0.60, 0.95, 35),
+         window_px=WINDOW_PX,
+         white_balance=True):
+
+    # ---------- load images ------------------------------------------------
+    imgs_bgr, labels = [], []
+    for p in sampleA_paths:
+        imgs_bgr.append(load_and_wb(p, white_balance))
+        labels.append("Back")
+    for p in sampleB_paths:
+        imgs_bgr.append(load_and_wb(p, white_balance))
+        labels.append("Foot")
+
+    # ---------- extract Lab features --------------------------------------
     feats_all, feats_list, shapes = [], [], []
     for bgr in imgs_bgr:
         feats, keep, shp = lab_features(bgr)
@@ -95,135 +167,143 @@ def main():
         shapes.append(shp)
     feats_all = np.vstack(feats_all)
 
-    # fit GMM
-    gmm = fit_gmm(feats_all, K)
-    k = gmm.n_components
-    print(f"GMM fitted with k = {k}")
+    # ---------- fit global GMM --------------------------------------------
+    gmm = fit_gmm(feats_all, k_clusters)
+    print(f"GMM fitted with k={gmm.n_components}")
 
-    # predict clusters & hue-sort
+    # ---------- predict clusters + hue-sort palette -----------------------
     labels_sorted, cmaps = [], None
     for feats, shp in zip(feats_list, shapes):
         lbl_flat = gmm.predict(feats)
-        lbl_img = lbl_flat.reshape(shp)
+        lbl_img  = lbl_flat.reshape(shp)
         remap, cmap = hue_sort_remap(gmm, lbl_img)
         labels_sorted.append(remap)
-        cmaps = cmap   # same palette for both
+        cmaps = cmap                         # common palette
 
-    # choose dye cluster = most-negative b*
-    blue_idx = np.argmin(gmm.means_[:, 1])
+    # ---------- blue cluster ----------------------------------------------
+    blue_idx = np.argmin(gmm.means_[:, 1])  # most-negative b*
     print(f"Dye (blue) cluster index = {blue_idx}")
 
-    # soft blueness & rolling density
     blueness_maps, density_maps = [], []
     for feats, shp in zip(feats_list, shapes):
         proba = gmm.predict_proba(feats)[:, blue_idx].reshape(shp)
         blueness_maps.append(proba)
-        density_maps.append(uniform_filter(proba, size=WINDOW_PX, mode="reflect"))
+        density_maps.append(uniform_filter(proba, size=window_px, mode="reflect"))
 
-    # ---------------------------------------------------------------------------
-    # Put this after density_maps have been created (they’re on the 0–1 scale).
-    # density_maps[0]  → Sample A   |  density_maps[1]  → Sample B
-    # ---------------------------------------------------------------------------
+    # ---------- threshold scan --------------------------------------------
+    frac_by_sample = group_frac_above_thresh(density_maps, labels, thresholds)
 
-    # 1️⃣  pick thresholds to scan  (coarser or finer as you prefer)
-    THRESHOLDS = np.linspace(0.60, 0.95, 35)      # 0.10, 0.15, … 0.90
-
-    fracA, fracB = [], []
-    for t in THRESHOLDS:
-        fracA.append((density_maps[0] >= t).mean())
-        fracB.append((density_maps[1] >= t).mean())
-
-    # 2️⃣  print a compact table
     print("\nFraction of *entire image* above each density threshold")
-    print(" thr   A(frac)   B(frac)   Δ(B–A)")
-    for t, a, b in zip(THRESHOLDS, fracA, fracB):
-        print(f"{t:4.2f}   {a:7.3f}   {b:7.3f}   {b-a:+.3f}")
+    header = " thr   " + "   ".join(f"{lab}(frac)" for lab in frac_by_sample)
+    print(header)
+    for i, t in enumerate(thresholds):
+        row = [f"{t:4.2f}"] + [f"{frac_by_sample[lab][i]:7.3f}"
+                                for lab in frac_by_sample]
+        print("   ".join(row))
 
-    # 3️⃣  quick visual – cumulative area curves
+    # ---------- quick visual: cumulative area curves ----------------------
     plt.figure(figsize=(4.5, 3.5))
-    plt.plot(THRESHOLDS, fracA, 'o-', label='Sample A')
-    plt.plot(THRESHOLDS, fracB, 's-', label='Sample B')
-    plt.xlabel("density ≥ threshold")
-    plt.ylabel("fraction of image")
-    plt.title("Smoothed blue-density area curves")
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
+    for lab, marker in zip(frac_by_sample, ['o-', 's-']):
+        plt.plot(thresholds, frac_by_sample[lab], marker, label=f"Sample {lab}")
+    plt.xlabel("density ≥ threshold"); plt.ylabel("fraction of image")
+    plt.title("Smoothed blue-density area curves"); plt.legend(); plt.tight_layout()
+    plt.savefig("density_thresholds.png")
+    #plt.show()
 
-
-    # ------------------- visual panel ---------------------------------------
-    titles = ["Original",
-              "Hue-sorted clusters",
-              "Soft blueness  P(blue)",
-              f"Smoothed density  (window={WINDOW_PX}px)"]
-    fig, axes = plt.subplots(2, 4, figsize=(16, 8))
-
-    for row, (bgr, lbl, blu, dens) in zip(
-            axes, zip(imgs_bgr, labels_sorted, blueness_maps, density_maps)):
-        row[0].imshow(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)); row[0].set_title(titles[0])
-        row[1].imshow(lbl, cmap=cmaps, vmin=0, vmax=k-1);    row[1].set_title(titles[1])
-        im1 = row[2].imshow(blu, cmap="Blues", vmin=0, vmax=1); row[2].set_title(titles[2])
-        im2 = row[3].imshow(dens, cmap="Blues", vmin=0, vmax=1); row[3].set_title(titles[3])
-        for ax in row: ax.axis('off')
-
-    fig.colorbar(im1, ax=axes[:, 2].ravel().tolist(),
-                 fraction=0.02, pad=0.02, label="P(blue)")
-    fig.colorbar(im2, ax=axes[:, 3].ravel().tolist(),
-                 fraction=0.02, pad=0.02, label="Density")
+    # ---------- (optional) per-image montage ------------------------------
+    # Makes sense only for small N; otherwise comment out or adapt
+    titles = ["Original", "Hue-sorted clusters",
+              "Soft blueness P(blue)",
+              f"Smoothed density (window={window_px}px)"]
+    n_img = len(imgs_bgr)
+    fig, axes = plt.subplots(n_img, 4, figsize=(16, 4*n_img))
+    axes = np.atleast_2d(axes)
+    for axrow, bgr, lbl, blu, dens in zip(
+            axes, imgs_bgr, labels_sorted, blueness_maps, density_maps):
+        axrow[0].imshow(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)); axrow[0].set_title(titles[0])
+        axrow[1].imshow(lbl, cmap=cmaps, vmin=0, vmax=gmm.n_components-1); axrow[1].set_title(titles[1])
+        axrow[2].imshow(blu, cmap="Blues", vmin=0, vmax=1); axrow[2].set_title(titles[2])
+        axrow[3].imshow(dens, cmap="Blues", vmin=0, vmax=1); axrow[3].set_title(titles[3])
+        for ax in axrow: ax.axis("off")
     fig.suptitle("Dye classification & density — common scale", fontsize=16)
-    plt.tight_layout(); plt.show()
+    plt.tight_layout(); 
+    plt.savefig("Dyed_Images.png")
+    #plt.show()
 
-    # --------------- numeric summary ---------------------------------------
-    print("\nMean smoothed density:")
-    for name, dens in zip(("Sample A", "Sample B"), density_maps):
-        print(f"  {name}: {dens.mean():.4f}")
-
-    print("\nMax smoothed density:")
-    for name, dens in zip(("Sample A", "Sample B"), density_maps):
-        print(f"  {name}: {dens.max():.4f}")
-
-    # sweep a logarithmic-ish range of window sizes
-    W_LIST = list(range(3, 41, 2)) + list(range(32, 301, 8))  # 3,5,7,…,29,32,40,…
-
+    # ---------- numeric summary ------------------------------------------
     rows = []
-    prev_dA = prev_dB = None
+    for dens, lab, p in zip(density_maps, labels, sampleA_paths + sampleB_paths):
+        rows.append({
+            "sample": lab,
+            "image":  Path(p).name,          # file name only; drop Path(.) to keep full path
+            "mean":   dens.mean(),
+            "max":    dens.max()
+        })
 
-    for w in W_LIST:
-        dA = uniform_filter(blueness_maps[0], size=w, mode="reflect")
-        dB = uniform_filter(blueness_maps[1], size=w, mode="reflect")
+    df_img = pd.DataFrame(rows)
 
-        sdA, sdB = dA.std(), dB.std()
-        deltaA = np.nan if prev_dA is None else np.mean(np.abs(dA - prev_dA))
-        deltaB = np.nan if prev_dB is None else np.mean(np.abs(dB - prev_dB))
+    # pretty printing helpers
+    fmt = {"mean": "{:.4f}".format, "max": "{:.4f}".format}
 
-        rows.append(dict(w=w,
-                     sd_mean=(sdA+sdB)/2,
-                     delta_mean=np.nanmean([deltaA, deltaB])))
-        prev_dA, prev_dB = dA, dB
+    print("\nPer-image smoothed density")
+    print(df_img.to_string(index=False, formatters=fmt))
 
-    df = pd.DataFrame(rows)
+    df_sample = (df_img
+                 .groupby("sample", as_index=False)
+                 .agg(mean=("mean", "mean"),
+                      max =("max",  "mean")))          # mean of per-image maxima
+    print("\nPer-sample aggregate")
+    print(df_sample.to_string(index=False, formatters=fmt))
 
-    # df has columns 'w' and 'sd_mean' from the sweep ----------------------------
-    tail = df.sd_mean.tail(5).values           # last 5 windows in the sweep
-    sigma_inf = np.median(tail)                # plateau estimate
+    for lab in sorted(set(labels)):
+        lab_dens = np.stack([d for d, l in zip(density_maps, labels) if l == lab])
+        print(f"\nSample {lab}:")
+        print(f"  Mean smoothed density  : {lab_dens.mean():.4f}")
+        print(f"  Max  smoothed density  : {lab_dens.max():.4f}")
 
-    tol = 0.02                                 # 2 %
-    candidate = df[df.sd_mean <= sigma_inf * (1 + tol)].w.min()
-    windowpx = int(candidate)
-    print(f"Plateau σ∞ ≈ {sigma_inf:.3f};  selecting window = {windowpx}px")
-
-
-    # plot
+    # ---------- window-sweep (unchanged, still uses first two images) -----
+    # If you want this averaged over *all* images per sample, adapt exactly
+    # the same way you did above (group → aggregate).  Left as-is for brevity.
+    # ----------------------------------------------------------------------
+    # ------------------------------------------------------------
+    # pick window automatically
+    windowpx, sweep_df = choose_optimal_window(blueness_maps, labels)
+    print(f"\nPlateau σ∞ ≈ {sweep_df['sd_mean'].tail(5).median():.3f}; "
+          f"selecting window = {windowpx}px")
+    
+    # quick diagnostic plot
     fig, ax1 = plt.subplots(figsize=(6,4))
-    ax1.plot(df.w, df.sd_mean, 'o-', label='mean SD')
+    ax1.plot(sweep_df.index, sweep_df['sd_mean'], 'o-', label='mean SD')
     ax1.set_xlabel('window size (px)'); ax1.set_ylabel('σ (smoothed)')
     ax2 = ax1.twinx()
-    ax2.plot(df.w, df.delta_mean, 's--', color='orange', label='mean Δ')
+    ax2.plot(sweep_df.index, sweep_df['delta_mean'], 's--',
+             label='mean Δ', color='orange')
     ax2.set_ylabel('Δ to previous')
-    fig.legend(loc='upper right'); fig.tight_layout(); plt.show()
+    fig.legend(loc='upper right'); fig.tight_layout();
+    plt.savefig("diag_plot_recommended_window_size.png")
+    #plt.show()
 
 
+
+
+# --------------------------------------------------------------------------
+# --- CLI entry point -------------------------------------------------------
+# --------------------------------------------------------------------------
 if __name__ == "__main__":
-    main()
+    import argparse, glob
+    ap = argparse.ArgumentParser(description="Two-sample dye-density analysis")
+    ap.add_argument("--sample_back", required=True, nargs="+",
+                    help="glob(s) or file(s) for first sample set")
+    ap.add_argument("--sample_foot", required=True, nargs="+",
+                    help="glob(s) or file(s) for second sample set")
+    args = ap.parse_args()
 
+    # expand globs → paths
+    expand = lambda patterns: [p for pat in patterns for p in glob.glob(pat)]
+    pathsA = expand(args.sample_back)
+    pathsB = expand(args.sample_foot)
 
+    if not pathsA or not pathsB:
+        raise SystemExit("Both --sample_back and --sample_foot need at least one image.")
+
+    main(pathsA, pathsB)
